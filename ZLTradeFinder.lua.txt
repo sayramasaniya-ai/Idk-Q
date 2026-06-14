@@ -1,0 +1,955 @@
+--[[
+========================================
+
+╔════════════════════════╗
+║          Cypher Spectre ║ EnvSight      ║
+╚════════════════════════╝
+
+Script Deobfuscated by Cypher Spectre 
+Version: EnvSight 
+
+Author on Discord / TikTok:
+@roman666cabj
+
+========================================
+
+]]
+
+
+
+-- ================================================
+--   ZL Trade Finder | Brainrot Trading
+--   LocalScript para ejecutor (Delta, etc.)
+--   UI responsive + draggable PC/Mobil + request + expirados filtrados
+-- ================================================
+
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+    error("No se encontró LocalPlayer")
+end
+
+local function getUiParent()
+    local ok, hui = pcall(function()
+        if typeof(gethui) == "function" then
+            return gethui()
+        end
+        return nil
+    end)
+
+    if ok and hui then
+        return hui
+    end
+
+    local ok2, core = pcall(function()
+        return game:GetService("CoreGui")
+    end)
+    if ok2 and core then
+        return core
+    end
+
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local UIParent = getUiParent()
+
+-- ================================================
+--  CONFIG
+-- ================================================
+local CONFIG = {
+    API_URL = "https://zlchat.goalforest.workers.dev/api/trades",
+    REFRESH_RATE = 5,
+    AUTO_REFRESH = true,
+    MIN_GEN_VALUE = 0,
+    SHOW_ONLY_MUTATIONS = false,
+    SHOW_ONLY_LOOKING = true,
+    FILTER_EXPIRED = true,
+    REQUEST_TIMEOUT_FALLBACK = 15,
+}
+
+-- ================================================
+--  COLORES
+-- ================================================
+local RARITY_COLORS = {
+    Secret = Color3.fromRGB(255, 60, 60),
+    Legendary = Color3.fromRGB(255, 170, 0),
+    Epic = Color3.fromRGB(160, 60, 255),
+    Rare = Color3.fromRGB(60, 120, 255),
+    Uncommon = Color3.fromRGB(60, 200, 60),
+    Common = Color3.fromRGB(180, 180, 180),
+}
+
+local MUTATION_COLORS = {
+    Diamond = Color3.fromRGB(130, 230, 255),
+    Gold = Color3.fromRGB(255, 215, 0),
+    Galaxy = Color3.fromRGB(200, 100, 255),
+    None = Color3.fromRGB(120, 120, 120),
+}
+
+local function getRarityColor(rarity)
+    return RARITY_COLORS[rarity] or Color3.fromRGB(200, 200, 200)
+end
+
+local function getMutationColor(mutation)
+    return MUTATION_COLORS[mutation] or Color3.fromRGB(180, 180, 180)
+end
+
+-- ================================================
+--  HELPERS
+-- ================================================
+local function nowMs()
+    return DateTime.now().UnixTimestampMillis
+end
+
+local function asNumber(v, fallback)
+    local n = tonumber(v)
+    if n == nil then
+        return fallback or 0
+    end
+    return n
+end
+
+local function safeLower(v)
+    return tostring(v or ""):lower()
+end
+
+local function compactNumber(n)
+    n = asNumber(n, 0)
+    local absN = math.abs(n)
+
+    if absN >= 1e12 then
+        return string.format("%.1fT", n / 1e12):gsub("%.0T", "T")
+    elseif absN >= 1e9 then
+        return string.format("%.1fB", n / 1e9):gsub("%.0B", "B")
+    elseif absN >= 1e6 then
+        return string.format("%.1fM", n / 1e6):gsub("%.0M", "M")
+    elseif absN >= 1e3 then
+        return string.format("%.1fK", n / 1e3):gsub("%.0K", "K")
+    end
+
+    return tostring(math.floor(n))
+end
+
+local function getGenText(trade)
+    if trade and trade.genText and tostring(trade.genText) ~= "" then
+        return tostring(trade.genText)
+    end
+
+    local gv = asNumber(trade and trade.genValue, 0)
+    return "$" .. compactNumber(gv) .. "/s"
+end
+
+local function isExpiredTrade(trade)
+    if not trade then
+        return true
+    end
+
+    local exp = asNumber(trade.expiresAt, 0)
+    if exp <= 0 then
+        return false
+    end
+
+    return exp <= nowMs()
+end
+
+local function isValidStatus(trade)
+    if not trade then
+        return false
+    end
+
+    local status = safeLower(trade.status)
+    if status == "" then
+        return true
+    end
+
+    if CONFIG.SHOW_ONLY_LOOKING then
+        return status == "looking"
+    end
+
+    return true
+end
+
+local function getRequestFunction()
+    local candidates = {
+        (syn and syn.request),
+        http_request,
+        (http and http.request),
+        request,
+        (fluxus and fluxus.request),
+        (krnl and krnl.request),
+    }
+
+    for _, fn in ipairs(candidates) do
+        if type(fn) == "function" then
+            return fn
+        end
+    end
+
+    return nil
+end
+
+local request = http_request 
+    or (syn and syn.request) 
+    or (fluxus and fluxus.request) 
+    or (http and http.request) 
+    or (getgenv and getgenv().request)
+
+local function doHttpGet(url)
+    if not request then
+        return false, "No request function"
+    end
+
+    local ok, res = pcall(function()
+        return request({
+            Url = url,
+            Method = "GET",
+            Headers = {
+                ["Accept"] = "application/json"
+            }
+        })
+    end)
+
+    if not ok or not res then
+        return false, "Request failed"
+    end
+
+    local body = res.Body or res.body
+    if type(body) ~= "string" then
+        return false, "Invalid body"
+    end
+
+    return true, body
+end
+
+local function decodeTrades(payload)
+    local ok, decoded = pcall(function()
+        return HttpService:JSONDecode(payload)
+    end)
+
+    if not ok then
+        return {}
+    end
+
+    if type(decoded) ~= "table" then
+        return {}
+    end
+
+    if decoded[1] ~= nil then
+        return decoded
+    end
+
+    if type(decoded.data) == "table" then
+        return decoded.data
+    end
+
+    if type(decoded.trades) == "table" then
+        return decoded.trades
+    end
+
+    return decoded
+end
+
+local function getViewport()
+    local cam = workspace.CurrentCamera
+    if cam then
+        return cam.ViewportSize
+    end
+    return Vector2.new(1280, 720)
+end
+
+-- ================================================
+--  DUID UI PREVIO
+-- ================================================
+local old = UIParent:FindFirstChild("ZLTradeFinderUI")
+if old then
+    old:Destroy()
+end
+
+-- ================================================
+--  GUI BASE
+-- ================================================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "ZLTradeFinderUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.DisplayOrder = 9999
+ScreenGui.Parent = UIParent
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+MainFrame.Position = UDim2.fromScale(0.5, 0.5)
+MainFrame.Size = UDim2.fromOffset(450, 620)
+MainFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+MainFrame.BorderSizePixel = 0
+MainFrame.ClipsDescendants = true
+MainFrame.Parent = ScreenGui
+
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 12)
+MainCorner.Parent = MainFrame
+
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Color = Color3.fromRGB(255, 60, 60)
+MainStroke.Thickness = 1.5
+MainStroke.Parent = MainFrame
+
+local MainPadding = Instance.new("UIPadding")
+MainPadding.PaddingTop = UDim.new(0, 10)
+MainPadding.PaddingLeft = UDim.new(0, 10)
+MainPadding.PaddingRight = UDim.new(0, 10)
+MainPadding.PaddingBottom = UDim.new(0, 10)
+MainPadding.Parent = MainFrame
+
+local TitleBar = Instance.new("Frame")
+TitleBar.Name = "TitleBar"
+TitleBar.Size = UDim2.new(1, 0, 0, 44)
+TitleBar.BackgroundColor3 = Color3.fromRGB(20, 20, 28)
+TitleBar.BorderSizePixel = 0
+TitleBar.Parent = MainFrame
+
+local TitleCorner = Instance.new("UICorner")
+TitleCorner.CornerRadius = UDim.new(0, 12)
+TitleCorner.Parent = TitleBar
+
+local TitlePatch = Instance.new("Frame")
+TitlePatch.Size = UDim2.new(1, 0, 0.5, 0)
+TitlePatch.Position = UDim2.new(0, 0, 0.5, 0)
+TitlePatch.BackgroundColor3 = Color3.fromRGB(20, 20, 28)
+TitlePatch.BorderSizePixel = 0
+TitlePatch.Parent = TitleBar
+
+local TitleStroke = Instance.new("UIGradient")
+TitleStroke.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(200, 30, 30)),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 80, 80)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(200, 30, 30)),
+})
+TitleStroke.Rotation = 90
+TitleStroke.Parent = MainStroke
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Size = UDim2.new(1, -110, 1, 0)
+TitleLabel.Position = UDim2.new(0, 12, 0, 0)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = "🔴  ZL Trade Finder"
+TitleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+TitleLabel.TextSize = 16
+TitleLabel.Font = Enum.Font.GothamBold
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.Parent = TitleBar
+
+local MinBtn = Instance.new("TextButton")
+MinBtn.Size = UDim2.fromOffset(28, 28)
+MinBtn.Position = UDim2.new(1, -68, 0, 8)
+MinBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
+MinBtn.Text = "—"
+MinBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+MinBtn.TextSize = 14
+MinBtn.Font = Enum.Font.GothamBold
+MinBtn.BorderSizePixel = 0
+MinBtn.Parent = TitleBar
+
+local MinCorner = Instance.new("UICorner")
+MinCorner.CornerRadius = UDim.new(0, 6)
+MinCorner.Parent = MinBtn
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size = UDim2.fromOffset(28, 28)
+CloseBtn.Position = UDim2.new(1, -36, 0, 8)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(200, 40, 40)
+CloseBtn.Text = "✕"
+CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+CloseBtn.TextSize = 14
+CloseBtn.Font = Enum.Font.GothamBold
+CloseBtn.BorderSizePixel = 0
+CloseBtn.Parent = TitleBar
+
+local CloseCorner = Instance.new("UICorner")
+CloseCorner.CornerRadius = UDim.new(0, 6)
+CloseCorner.Parent = CloseBtn
+
+local StatusLabel = Instance.new("TextLabel")
+StatusLabel.Name = "StatusLabel"
+StatusLabel.Size = UDim2.new(1, 0, 0, 18)
+StatusLabel.Position = UDim2.new(0, 0, 0, 50)
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.Text = "Cargando trades..."
+StatusLabel.TextColor3 = Color3.fromRGB(160, 160, 160)
+StatusLabel.TextSize = 11
+StatusLabel.Font = Enum.Font.Gotham
+StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+StatusLabel.Parent = MainFrame
+
+local FilterFrame = Instance.new("Frame")
+FilterFrame.Name = "FilterFrame"
+FilterFrame.BackgroundColor3 = Color3.fromRGB(22, 22, 32)
+FilterFrame.BorderSizePixel = 0
+FilterFrame.Parent = MainFrame
+
+local FilterCorner = Instance.new("UICorner")
+FilterCorner.CornerRadius = UDim.new(0, 8)
+FilterCorner.Parent = FilterFrame
+
+local SearchBox = Instance.new("TextBox")
+SearchBox.Name = "SearchBox"
+SearchBox.BackgroundColor3 = Color3.fromRGB(30, 30, 42)
+SearchBox.BorderSizePixel = 0
+SearchBox.TextColor3 = Color3.fromRGB(235, 235, 235)
+SearchBox.PlaceholderColor3 = Color3.fromRGB(110, 110, 130)
+SearchBox.PlaceholderText = "🔍 Buscar animal / usuario / traits..."
+SearchBox.ClearTextOnFocus = false
+SearchBox.Text = ""
+SearchBox.Font = Enum.Font.Gotham
+SearchBox.TextSize = 12
+SearchBox.Parent = FilterFrame
+
+local SearchCorner = Instance.new("UICorner")
+SearchCorner.CornerRadius = UDim.new(0, 6)
+SearchCorner.Parent = SearchBox
+
+local MutBtn = Instance.new("TextButton")
+MutBtn.Name = "MutBtn"
+MutBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 55)
+MutBtn.BorderSizePixel = 0
+MutBtn.Text = "Solo mutados"
+MutBtn.TextColor3 = Color3.fromRGB(180, 180, 200)
+MutBtn.Font = Enum.Font.Gotham
+MutBtn.TextSize = 11
+MutBtn.Parent = FilterFrame
+
+local MutCorner = Instance.new("UICorner")
+MutCorner.CornerRadius = UDim.new(0, 6)
+MutCorner.Parent = MutBtn
+
+local RefreshBtn = Instance.new("TextButton")
+RefreshBtn.Name = "RefreshBtn"
+RefreshBtn.BackgroundColor3 = Color3.fromRGB(180, 30, 30)
+RefreshBtn.BorderSizePixel = 0
+RefreshBtn.Text = "↻ Refresh"
+RefreshBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+RefreshBtn.Font = Enum.Font.GothamBold
+RefreshBtn.TextSize = 11
+RefreshBtn.Parent = FilterFrame
+
+local RefreshCorner = Instance.new("UICorner")
+RefreshCorner.CornerRadius = UDim.new(0, 6)
+RefreshCorner.Parent = RefreshBtn
+
+local TradeListFrame = Instance.new("ScrollingFrame")
+TradeListFrame.Name = "TradeList"
+TradeListFrame.BackgroundColor3 = Color3.fromRGB(12, 12, 18)
+TradeListFrame.BorderSizePixel = 0
+TradeListFrame.ScrollBarThickness = 4
+TradeListFrame.ScrollBarImageColor3 = Color3.fromRGB(255, 60, 60)
+TradeListFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+TradeListFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+TradeListFrame.Parent = MainFrame
+
+local ListCorner = Instance.new("UICorner")
+ListCorner.CornerRadius = UDim.new(0, 8)
+ListCorner.Parent = TradeListFrame
+
+local ListPadding = Instance.new("UIPadding")
+ListPadding.PaddingTop = UDim.new(0, 6)
+ListPadding.PaddingLeft = UDim.new(0, 6)
+ListPadding.PaddingRight = UDim.new(0, 6)
+ListPadding.PaddingBottom = UDim.new(0, 6)
+ListPadding.Parent = TradeListFrame
+
+local ListLayout = Instance.new("UIListLayout")
+ListLayout.Padding = UDim.new(0, 6)
+ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+ListLayout.Parent = TradeListFrame
+
+local FooterLabel = Instance.new("TextLabel")
+FooterLabel.Name = "FooterLabel"
+FooterLabel.Size = UDim2.new(1, 0, 0, 18)
+FooterLabel.Position = UDim2.new(0, 0, 1, -22)
+FooterLabel.BackgroundTransparency = 1
+FooterLabel.Text = "0 trades cargados"
+FooterLabel.TextColor3 = Color3.fromRGB(100, 100, 120)
+FooterLabel.TextSize = 11
+FooterLabel.Font = Enum.Font.Gotham
+FooterLabel.TextXAlignment = Enum.TextXAlignment.Center
+FooterLabel.Parent = MainFrame
+
+-- ================================================
+--  LAYOUT RESPONSIVE
+-- ================================================
+local isMinimized = false
+local expandedSize = UDim2.fromOffset(450, 620)
+local currentMainHeight = 620
+local bodyVisible = true
+
+local function setBodyVisible(state)
+    bodyVisible = state
+    StatusLabel.Visible = state
+    FilterFrame.Visible = state
+    TradeListFrame.Visible = state
+    FooterLabel.Visible = state
+end
+
+local function applyResponsiveLayout()
+    local vp = getViewport()
+    local small = vp.X < 650 or vp.Y < 520
+
+    local width
+    local height
+
+    if small then
+        width = math.clamp(vp.X * 0.94, 320, 560)
+        height = math.clamp(vp.Y * 0.84, 430, 760)
+    else
+        width = math.clamp(vp.X * 0.42, 380, 540)
+        height = math.clamp(vp.Y * 0.72, 500, 700)
+    end
+
+    expandedSize = UDim2.fromOffset(math.floor(width), math.floor(height))
+    currentMainHeight = expandedSize.Y.Offset
+
+    if not isMinimized then
+        MainFrame.Size = expandedSize
+    end
+
+    local filterY = small and 76 or 66
+    local filterH = small and 74 or 40
+    local listY = filterY + filterH + 8
+
+    StatusLabel.Position = UDim2.new(0, 0, 0, 50)
+
+    FilterFrame.Position = UDim2.new(0, 0, 0, filterY)
+    FilterFrame.Size = UDim2.new(1, 0, 0, filterH)
+
+    if small then
+        SearchBox.Position = UDim2.new(0, 6, 0, 6)
+        SearchBox.Size = UDim2.new(1, -12, 0, 28)
+
+        MutBtn.Position = UDim2.new(0, 6, 0, 40)
+        MutBtn.Size = UDim2.new(0.5, -9, 0, 28)
+
+        RefreshBtn.Position = UDim2.new(0.5, 3, 0, 40)
+        RefreshBtn.Size = UDim2.new(0.5, -9, 0, 28)
+    else
+        SearchBox.Position = UDim2.new(0, 6, 0.5, -13)
+        SearchBox.Size = UDim2.new(0.58, -10, 0, 26)
+
+        MutBtn.Position = UDim2.new(0.59, -2, 0.5, -13)
+        MutBtn.Size = UDim2.new(0.23, -6, 0, 26)
+
+        RefreshBtn.Position = UDim2.new(1, -76, 0.5, -13)
+        RefreshBtn.Size = UDim2.fromOffset(70, 26)
+    end
+
+    TradeListFrame.Position = UDim2.new(0, 0, 0, listY)
+    TradeListFrame.Size = UDim2.new(1, 0, 1, -(listY + 32))
+end
+
+applyResponsiveLayout()
+
+if workspace.CurrentCamera then
+    workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+        applyResponsiveLayout()
+    end)
+end
+
+-- ================================================
+--  DRAG PC + MÓVIL
+-- ================================================
+do
+    local dragging = false
+    local dragInput = nil
+    local dragStart = nil
+    local startPos = nil
+
+    local function update(input)
+        if not dragging or not dragStart or not startPos then
+            return
+        end
+
+        local delta = input.Position - dragStart
+        MainFrame.Position = UDim2.new(
+            startPos.X.Scale,
+            startPos.X.Offset + delta.X,
+            startPos.Y.Scale,
+            startPos.Y.Offset + delta.Y
+        )
+    end
+
+    TitleBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragInput = input
+            dragStart = input.Position
+            startPos = MainFrame.Position
+        end
+    end)
+
+    TitleBar.InputEnded:Connect(function(input)
+        if input == dragInput then
+            dragging = false
+            dragInput = nil
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and input == dragInput then
+            if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+                update(input)
+            end
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input == dragInput then
+            dragging = false
+            dragInput = nil
+        end
+    end)
+end
+
+-- ================================================
+--  MINIMIZAR
+-- ================================================
+local function setMinimized(state)
+    isMinimized = state
+
+    if state then
+        setBodyVisible(false)
+        MinBtn.Text = "▢"
+        TweenService:Create(
+            MainFrame,
+            TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            { Size = UDim2.fromOffset(expandedSize.X.Offset, 44) }
+        ):Play()
+    else
+        setBodyVisible(true)
+        MinBtn.Text = "—"
+        TweenService:Create(
+            MainFrame,
+            TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            { Size = expandedSize }
+        ):Play()
+    end
+end
+
+MinBtn.MouseButton1Click:Connect(function()
+    setMinimized(not isMinimized)
+end)
+
+CloseBtn.MouseButton1Click:Connect(function()
+    ScreenGui:Destroy()
+end)
+
+-- ================================================
+--  RENDER DE TARJETAS
+-- ================================================
+local function clearTradeList()
+    for _, child in ipairs(TradeListFrame:GetChildren()) do
+        if child:IsA("Frame") and child.Name:sub(1, 5) == "Card_" then
+            child:Destroy()
+        end
+    end
+end
+
+local function createTradeCard(trade, index)
+    local rarityColor = getRarityColor(trade.rarity)
+    local mutation = tostring(trade.mutation or "None")
+    local hasMutation = mutation ~= "" and mutation ~= "None"
+    local mutationColor = getMutationColor(mutation)
+
+    local Card = Instance.new("Frame")
+    Card.Name = "Card_" .. index
+    Card.Size = UDim2.new(1, 0, 0, 84)
+    Card.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
+    Card.BorderSizePixel = 0
+    Card.LayoutOrder = index
+    Card.Parent = TradeListFrame
+
+    local CardCorner = Instance.new("UICorner")
+    CardCorner.CornerRadius = UDim.new(0, 8)
+    CardCorner.Parent = Card
+
+    local RarityBar = Instance.new("Frame")
+    RarityBar.Size = UDim2.new(0, 4, 1, 0)
+    RarityBar.BackgroundColor3 = rarityColor
+    RarityBar.BorderSizePixel = 0
+    RarityBar.Parent = Card
+
+    local RarityBarCorner = Instance.new("UICorner")
+    RarityBarCorner.CornerRadius = UDim.new(0, 4)
+    RarityBarCorner.Parent = RarityBar
+
+    local AnimalLabel = Instance.new("TextLabel")
+    AnimalLabel.Size = UDim2.new(1, -110, 0, 22)
+    AnimalLabel.Position = UDim2.new(0, 12, 0, 8)
+    AnimalLabel.BackgroundTransparency = 1
+    AnimalLabel.Text = tostring(trade.animalDisplayName or trade.animal or "Unknown")
+    AnimalLabel.TextColor3 = Color3.fromRGB(240, 240, 255)
+    AnimalLabel.TextSize = 14
+    AnimalLabel.Font = Enum.Font.GothamBold
+    AnimalLabel.TextXAlignment = Enum.TextXAlignment.Left
+    AnimalLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    AnimalLabel.Parent = Card
+
+    local GenLabel = Instance.new("TextLabel")
+    GenLabel.Size = UDim2.new(0, 100, 0, 22)
+    GenLabel.Position = UDim2.new(1, -104, 0, 8)
+    GenLabel.BackgroundTransparency = 1
+    GenLabel.Text = getGenText(trade)
+    GenLabel.TextColor3 = Color3.fromRGB(80, 255, 120)
+    GenLabel.TextSize = 13
+    GenLabel.Font = Enum.Font.GothamBold
+    GenLabel.TextXAlignment = Enum.TextXAlignment.Right
+    GenLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    GenLabel.Parent = Card
+
+    local RarityLabel = Instance.new("TextLabel")
+    RarityLabel.Size = UDim2.new(0, 78, 0, 18)
+    RarityLabel.Position = UDim2.new(0, 12, 0, 34)
+    RarityLabel.BackgroundColor3 = rarityColor
+    RarityLabel.BackgroundTransparency = 0.55
+    RarityLabel.Text = tostring(trade.rarity or "?")
+    RarityLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    RarityLabel.TextSize = 11
+    RarityLabel.Font = Enum.Font.GothamBold
+    RarityLabel.Parent = Card
+
+    local RarityCorner = Instance.new("UICorner")
+    RarityCorner.CornerRadius = UDim.new(0, 4)
+    RarityCorner.Parent = RarityLabel
+
+    if hasMutation then
+        local MutLabel = Instance.new("TextLabel")
+        MutLabel.Size = UDim2.new(0, 74, 0, 18)
+        MutLabel.Position = UDim2.new(0, 96, 0, 34)
+        MutLabel.BackgroundColor3 = mutationColor
+        MutLabel.BackgroundTransparency = 0.5
+        MutLabel.Text = "✦ " .. mutation
+        MutLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+        MutLabel.TextSize = 11
+        MutLabel.Font = Enum.Font.GothamBold
+        MutLabel.Parent = Card
+
+        local MutCorner = Instance.new("UICorner")
+        MutCorner.CornerRadius = UDim.new(0, 4)
+        MutCorner.Parent = MutLabel
+    end
+
+    local traits = tostring(trade.traits or "")
+    local traitsText = (traits ~= "" and traits ~= "None") and ("🏷 " .. traits) or "🏷 Sin traits"
+
+    local TraitsLabel = Instance.new("TextLabel")
+    TraitsLabel.Size = UDim2.new(1, -16, 0, 16)
+    TraitsLabel.Position = UDim2.new(0, 12, 0, 56)
+    TraitsLabel.BackgroundTransparency = 1
+    TraitsLabel.Text = traitsText
+    TraitsLabel.TextColor3 = Color3.fromRGB(150, 150, 170)
+    TraitsLabel.TextSize = 11
+    TraitsLabel.Font = Enum.Font.Gotham
+    TraitsLabel.TextXAlignment = Enum.TextXAlignment.Left
+    TraitsLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    TraitsLabel.Parent = Card
+
+    local UserLabel = Instance.new("TextLabel")
+    UserLabel.Size = UDim2.new(1, -16, 0, 14)
+    UserLabel.Position = UDim2.new(0, 12, 1, -18)
+    UserLabel.BackgroundTransparency = 1
+    UserLabel.Text = "👤 " .. tostring(trade.username or trade.userId or "Unknown")
+    UserLabel.TextColor3 = Color3.fromRGB(100, 140, 255)
+    UserLabel.TextSize = 11
+    UserLabel.Font = Enum.Font.Gotham
+    UserLabel.TextXAlignment = Enum.TextXAlignment.Left
+    UserLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    UserLabel.Parent = Card
+
+    return Card
+end
+
+-- ================================================
+--  DATA / FILTROS
+-- ================================================
+local allTrades = {}
+local onlyMutated = CONFIG.SHOW_ONLY_MUTATIONS
+
+local function tradeMatchesFilters(trade, searchText)
+    if type(trade) ~= "table" then
+        return false
+    end
+
+    local genValue = asNumber(trade.genValue, 0)
+    if genValue < asNumber(CONFIG.MIN_GEN_VALUE, 0) then
+        return false
+    end
+
+    if CONFIG.FILTER_EXPIRED and isExpiredTrade(trade) then
+        return false
+    end
+
+    if not isValidStatus(trade) then
+        return false
+    end
+
+    local mutation = tostring(trade.mutation or "None")
+    local hasMutation = mutation ~= "" and mutation ~= "None"
+
+    if onlyMutated and not hasMutation then
+        return false
+    end
+
+    if searchText ~= "" then
+        local haystack = table.concat({
+            safeLower(trade.animalDisplayName),
+            safeLower(trade.animal),
+            safeLower(trade.username),
+            safeLower(trade.traits),
+            safeLower(trade.rarity),
+            safeLower(trade.mutation),
+        }, " | ")
+
+        if not haystack:find(searchText, 1, true) then
+            return false
+        end
+    end
+
+    return true
+end
+
+local function renderTrades()
+    clearTradeList()
+
+    local searchText = safeLower(SearchBox.Text)
+    local visible = {}
+    for _, trade in ipairs(allTrades) do
+        if tradeMatchesFilters(trade, searchText) then
+            table.insert(visible, trade)
+        end
+    end
+
+    table.sort(visible, function(a, b)
+        return asNumber(a.genValue, 0) > asNumber(b.genValue, 0)
+    end)
+
+    for i, trade in ipairs(visible) do
+        createTradeCard(trade, i)
+    end
+
+    FooterLabel.Text = string.format(
+        "%d trade%s encontrado%s",
+        #visible,
+        #visible == 1 and "" or "s",
+        #visible == 1 and "" or "s"
+    )
+
+    return #visible
+end
+
+-- ================================================
+--  FETCH
+-- ================================================
+local isFetching = false
+local pendingFetch = false
+local fetchNonce = 0
+
+local function fetchTrades()
+    if isFetching then
+        pendingFetch = true
+        return
+    end
+
+    isFetching = true
+    fetchNonce += 1
+    local myNonce = fetchNonce
+
+    StatusLabel.Text = "⏳ Actualizando..."
+
+    local ok, raw = doHttpGet(CONFIG.API_URL)
+    if not ok then
+        StatusLabel.Text = "❌ Error HTTP: " .. tostring(raw):sub(1, 80)
+        isFetching = false
+        if pendingFetch then
+            pendingFetch = false
+            task.defer(fetchTrades)
+        end
+        return
+    end
+
+    local decoded = decodeTrades(raw)
+    if type(decoded) ~= "table" then
+        allTrades = {}
+        StatusLabel.Text = "❌ JSON inválido"
+        isFetching = false
+        if pendingFetch then
+            pendingFetch = false
+            task.defer(fetchTrades)
+        end
+        return
+    end
+
+    allTrades = decoded
+    table.sort(allTrades, function(a, b)
+        return asNumber(a.genValue, 0) > asNumber(b.genValue, 0)
+    end)
+
+    local visibleCount = renderTrades()
+    if myNonce == fetchNonce then
+        StatusLabel.Text = string.format("✅ %d trades cargados · %d visibles", #allTrades, visibleCount)
+    end
+
+    isFetching = false
+
+    if pendingFetch then
+        pendingFetch = false
+        task.defer(fetchTrades)
+    end
+end
+
+-- ================================================
+--  EVENTOS
+-- ================================================
+SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
+    renderTrades()
+end)
+
+MutBtn.MouseButton1Click:Connect(function()
+    onlyMutated = not onlyMutated
+
+    if onlyMutated then
+        MutBtn.BackgroundColor3 = Color3.fromRGB(130, 60, 255)
+        MutBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    else
+        MutBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 55)
+        MutBtn.TextColor3 = Color3.fromRGB(180, 180, 200)
+    end
+
+    renderTrades()
+end)
+
+RefreshBtn.MouseButton1Click:Connect(function()
+    fetchTrades()
+end)
+
+-- ================================================
+--  AUTO REFRESH
+-- ================================================
+task.spawn(function()
+    while ScreenGui.Parent do
+        if CONFIG.AUTO_REFRESH and not isMinimized then
+            fetchTrades()
+        end
+        task.wait(CONFIG.REFRESH_RATE)
+    end
+end)
+
+-- ================================================
+--  INICIO
+-- ================================================
+task.defer(fetchTrades)
+
+print("[ZL Trade Finder] Cargado correctamente.")
